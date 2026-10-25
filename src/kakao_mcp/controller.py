@@ -633,61 +633,75 @@ def search_and_open_room(room_name: str) -> Dict:
         return {"success": False, "error": "KakaoTalk main window not found"}
 
     # Ensure KakaoTalk is in the foreground before sending keyboard events
-    if not _ensure_foreground(main_hwnd):
-        _log("Warning: Could not bring KakaoTalk to foreground")
+    before = {w["hwnd"] for w in list_chat_windows()}
+    candidates = []  # exact titles of non-matching results, offered back to the caller
 
-    # Ctrl+F activates the search bar (Edit becomes visible and focused)
-    edit_hwnd = _activate_search_and_get_edit(main_hwnd)
-    if edit_hwnd is None:
-        return {"success": False, "error": "Search box not found in KakaoTalk main window"}
+    # Try search results top-down until a window titled exactly room_name opens.
+    # Wrong windows opened along the way are closed again.
+    for idx in range(config.SEARCH_MAX_TRIES):
+        if not _ensure_foreground(main_hwnd):
+            _log("Warning: Could not bring KakaoTalk to foreground")
 
-    # Clear any existing text in the Edit using EM_SETSEL + WM_CLEAR
-    EM_SETSEL = 0x00B1
-    WM_CLEAR = 0x0303
-    win32api.SendMessage(edit_hwnd, EM_SETSEL, 0, -1)  # Select all
-    win32api.SendMessage(edit_hwnd, WM_CLEAR, 0, 0)     # Delete selected
-    time.sleep(config.EDIT_CLICK_WAIT_SEC)
+        # Ctrl+F activates the search bar (Edit becomes visible and focused)
+        edit_hwnd = _activate_search_and_get_edit(main_hwnd)
+        if edit_hwnd is None:
+            return {"success": False, "error": "Search box not found in KakaoTalk main window"}
 
-    # Type search text character by character using WM_CHAR
-    # This goes directly to the Edit control — no focus or clipboard needed
-    for ch in room_name:
-        win32api.SendMessage(edit_hwnd, config.WM_CHAR, ord(ch), 0)
-        time.sleep(config.SEARCH_CHAR_INTERVAL_SEC)
-    _log(f"Typed '{room_name}' into Edit via WM_CHAR")
-    time.sleep(config.SEARCH_RESULTS_WAIT_SEC)  # Wait for search results to populate
+        # Clear any existing text in the Edit using EM_SETSEL + WM_CLEAR
+        EM_SETSEL = 0x00B1
+        WM_CLEAR = 0x0303
+        win32api.SendMessage(edit_hwnd, EM_SETSEL, 0, -1)  # Select all
+        win32api.SendMessage(edit_hwnd, WM_CLEAR, 0, 0)     # Delete selected
+        time.sleep(config.EDIT_CLICK_WAIT_SEC)
 
-    # Press Enter to open the first search result (already selected by default)
-    _log("Pressing Enter to open first search result")
-    _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
-    _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
-    time.sleep(config.SEARCH_OPEN_WAIT_SEC)
+        # Type search text character by character using WM_CHAR
+        # This goes directly to the Edit control — no focus or clipboard needed
+        for ch in room_name:
+            win32api.SendMessage(edit_hwnd, config.WM_CHAR, ord(ch), 0)
+            time.sleep(config.SEARCH_CHAR_INTERVAL_SEC)
+        _log(f"Typed '{room_name}' into Edit via WM_CHAR")
+        time.sleep(config.SEARCH_RESULTS_WAIT_SEC)  # Wait for search results to populate
 
-    # Do NOT press Escape here — it would close the newly opened chat window
+        # The list remembers its last selection for the same query, so go back to
+        # the top first, then move down to the idx-th result and press Enter
+        for _ in range(config.SEARCH_MAX_TRIES):
+            _user32.keybd_event(config.VK_UP, 0, 0, 0)
+            _user32.keybd_event(config.VK_UP, 0, config.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.05)
+        for _ in range(idx):
+            _user32.keybd_event(config.VK_DOWN, 0, 0, 0)
+            _user32.keybd_event(config.VK_DOWN, 0, config.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.1)
+        _log(f"Pressing Enter to open search result #{idx + 1}")
+        _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
+        _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
+        time.sleep(config.SEARCH_OPEN_WAIT_SEC)
 
-    # Look for opened chat windows
-    all_windows = list_chat_windows()
-    _log(f"Open windows after search: {[w['title'] for w in all_windows]}")
-    for w in all_windows:
-        if w["title"] == room_name:
-            return {"success": True, "message": f"Opened chat room '{room_name}'", "hwnd": w["hwnd"]}
-    for w in all_windows:
-        if room_name in w["title"]:
-            return {
-                "success": True,
-                "message": f"Opened chat room '{w['title']}' (searched: '{room_name}')",
-                "hwnd": w["hwnd"],
-            }
-    if all_windows:
-        return {
-            "success": True,
-            "message": f"Opened a chat window (title: '{all_windows[0]['title']}')",
-            "hwnd": all_windows[0]["hwnd"],
-        }
+        # Do NOT press Escape here — it would close the newly opened chat window
+
+        all_windows = list_chat_windows()
+        _log(f"Open windows after search: {[w['title'] for w in all_windows]}")
+        for w in all_windows:
+            if w["title"] == room_name:
+                return {"success": True, "message": f"Opened chat room '{room_name}'", "hwnd": w["hwnd"]}
+
+        # The opened room comes to the front, even if it was already open before
+        fg = _user32.GetForegroundWindow()
+        opened = next((w for w in all_windows if w["hwnd"] == fg), None)
+        if opened is None:
+            break  # no room came up: no more results
+        if opened["title"] not in candidates:
+            candidates.append(opened["title"])
+        if fg not in before:  # leave rooms the user already had open
+            _log(f"Closing non-matching window '{opened['title']}'")
+            win32gui.PostMessage(fg, win32con.WM_CLOSE, 0, 0)
+            time.sleep(config.SEARCH_OPEN_WAIT_SEC)
 
     return {
         "success": False,
         "error": f"Chat room '{room_name}' not found after search. "
-                 "The exact room name may differ from search results.",
+                 "No search result opened a room with exactly this name.",
+        "candidates": candidates,
     }
 
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 """MCP Server for KakaoTalk PC automation via Win32 API."""
+import functools
 import os
 from typing import Dict, Optional
 
@@ -8,14 +9,71 @@ from mcp.server.fastmcp import FastMCP
 from kakao_mcp import controller
 from kakao_mcp import parser
 from kakao_mcp import config
+from kakao_mcp import aliases
+
+INSTRUCTIONS = """\
+카카오톡 PC를 Win32 API로 자동화하는 MCP 서버입니다(Windows + 카카오톡 PC 필요).
+
+방 이름은 정확히 일치해야 합니다
+- 방 이름을 받는 도구는 카카오톡 채팅방 창 제목과 글자 하나까지 같은 이름으로만 동작합니다.
+  예: 실제 방 이름이 '학원홍길동선생님'이면 '홍길동'이나 '학원 홍길동'으로는 열리지 않습니다
+  (아래 별칭 위키에 저장돼 있으면 열립니다).
+- kakao_open_room은 검색 결과를 위에서부터 열어 보며 이름이 정확히 같은 방을 찾고,
+  다른 방은 다시 닫습니다(원래 열려 있던 방은 닫지 않음). 이때 열어 본 방은 읽음 처리될 수 있습니다.
+- 정확히 같은 방이 없으면 error와 함께 candidates(검색된 방들의 정확한 이름)를 돌려줍니다.
+  이때 아무 방에나 보내지 말고, 사용자에게 "혹시 이 사람인가요?"라고 후보를 보여 주고 고르게 하세요.
+
+별칭 위키
+- 사용자가 부르는 이름 -> 정확한 방 이름을 저장하는 파일입니다:
+  %USERPROFILE%\\Documents\\KakaoMCP_aliases.json (예: {"홍길동": "학원홍길동선생님"})
+- 방 이름을 받는 모든 도구는 먼저 위키에서 이름을 찾아 정확한 방 이름으로 바꿔 씁니다.
+  그래서 한 번 저장된 별칭은 그 뒤로 바로 쓸 수 있습니다.
+- 사용자가 후보 중 하나를 고르면 kakao_open_room(room_name=<고른 방>, alias=<처음 말한 이름>)으로
+  여세요. 방이 열리면 그 짝이 위키에 자동으로 저장되고, 결과에 alias_saved가 나옵니다.
+- 파일을 직접 열어 별칭을 추가하거나 고쳐도 됩니다.
+
+보내기 전 확인
+- 보내기 도구(kakao_send_message, kakao_send_bulk, kakao_send_image, kakao_send_mention)는
+  실제로 메시지를 보냅니다. 받는 방과 내용을 사용자가 정한 경우에만 쓰세요.
+"""
+
+WELCOME = """\
+[처음 사용 안내 — 이 내용을 사용자에게 그대로 보여 주세요]
+카카오톡 MCP가 연결됐습니다.
+1. 방 이름은 카톡 채팅방 이름과 글자 하나까지 정확히 같아야 열리고 보낼 수 있습니다.
+2. 정확히 같은 방이 없으면 비슷한 방들을 후보로 보여 드립니다. 골라 주시면 그 방으로 보냅니다.
+3. 고르신 짝은 별칭 위키에 저장돼, 다음부터는 같은 이름으로 바로 보낼 수 있습니다.
+   예: '홍길동' -> '학원홍길동선생님'
+4. 별칭 위키 파일: {path}
+   직접 열어 별칭을 추가하거나 고쳐도 됩니다.
+5. 메시지는 받는 방과 내용을 정해 주셨을 때만 보냅니다.
+"""
 
 app = FastMCP(
     "kakao-mcp-server",
-    instructions="MCP Server for KakaoTalk PC automation via Win32 API",
+    instructions=INSTRUCTIONS,
 )
 
 
-@app.tool()
+def _tool():
+    """app.tool() that adds the welcome note to the first result ever returned.
+
+    "First" means the alias wiki file does not exist yet; it is created (empty)
+    right after, so the note shows once per user.
+    """
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            result = fn(*args, **kwargs)
+            if not os.path.isfile(config.ALIASES_FILE) and isinstance(result, dict):
+                aliases.save_all(aliases.load())
+                result["first_run_notice"] = WELCOME.format(path=config.ALIASES_FILE)
+            return result
+        return app.tool()(wrapper)
+    return decorate
+
+
+@_tool()
 def kakao_health_check() -> Dict:
     """Check if KakaoTalk PC is currently running.
     Returns status, window handle, and process ID."""
@@ -33,7 +91,7 @@ def kakao_health_check() -> Dict:
         return {"error": f"Health check failed: {e}"}
 
 
-@app.tool()
+@_tool()
 def kakao_list_open_rooms() -> Dict:
     """List all currently open KakaoTalk chat room windows.
     Returns a list of open chat rooms with their window titles."""
@@ -50,29 +108,44 @@ def kakao_list_open_rooms() -> Dict:
         return {"error": f"Failed to list rooms: {e}"}
 
 
-@app.tool()
-def kakao_open_room(room_name: str) -> Dict:
+@_tool()
+def kakao_open_room(room_name: str, alias: Optional[str] = None) -> Dict:
     """Open or bring to front a KakaoTalk chat room by name.
+    The name is first looked up in the alias wiki (e.g. '홍길동' -> '학원홍길동선생님').
     If the chat window is already open, brings it to foreground.
     If not, searches for the room in KakaoTalk's search bar.
+    If no result has exactly this name, returns "candidates": the exact names of
+    the rooms the search found. Ask the user which one they meant, then call again
+    with room_name=<their pick> and alias=<the name they originally said>.
 
     Args:
         room_name: The name of the chat room or person to open.
+        alias: The name the user originally used for this room. When the room opens,
+            alias -> room_name is saved to the alias wiki for next time.
     """
     try:
+        room_name = aliases.resolve(room_name)
         hwnd = controller.find_chat_window(room_name)
         if hwnd:
             controller.bring_window_to_front(hwnd)
-            return {"message": f"Chat room '{room_name}' brought to foreground", "hwnd": hwnd}
-        result = controller.search_and_open_room(room_name)
-        if result["success"]:
-            return {"message": result["message"], "hwnd": result.get("hwnd")}
-        return {"error": result["error"]}
+            reply = {"message": f"Chat room '{room_name}' brought to foreground", "hwnd": hwnd}
+        else:
+            result = controller.search_and_open_room(room_name)
+            if not result["success"]:
+                if result.get("candidates"):
+                    return {"error": result["error"], "candidates": result["candidates"]}
+                return {"error": result["error"]}
+            reply = {"message": result["message"], "hwnd": result.get("hwnd")}
+        reply["room_name"] = room_name
+        if alias and alias != room_name:
+            aliases.save(alias, room_name)
+            reply["alias_saved"] = f"'{alias}' -> '{room_name}'"
+        return reply
     except Exception as e:
         return {"error": f"Failed to open room '{room_name}': {e}"}
 
 
-@app.tool()
+@_tool()
 def kakao_send_message(room_name: str, message: str) -> Dict:
     """Send a text message to a KakaoTalk chat room.
     The chat room window must already be open.
@@ -82,6 +155,7 @@ def kakao_send_message(room_name: str, message: str) -> Dict:
         message: The text message to send.
     """
     try:
+        room_name = aliases.resolve(room_name)
         if not message.strip():
             return {"error": "Message cannot be empty"}
         result = controller.send_message_to_room(room_name, message)
@@ -92,7 +166,7 @@ def kakao_send_message(room_name: str, message: str) -> Dict:
         return {"error": f"Failed to send message: {e}"}
 
 
-@app.tool()
+@_tool()
 def kakao_send_bulk(room_names: list[str], message: str, interval_sec: float = 0.5) -> Dict:
     """Send the same message to multiple KakaoTalk chat rooms at once.
     Opens each room if not already open and sends the message sequentially.
@@ -104,6 +178,7 @@ def kakao_send_bulk(room_names: list[str], message: str, interval_sec: float = 0
         interval_sec: Seconds to wait between rooms (default 0.5, minimum 0.3).
     """
     try:
+        room_names = [aliases.resolve(n) for n in room_names]
         if not room_names:
             return {"error": "room_names cannot be empty"}
         if not message.strip():
@@ -116,7 +191,7 @@ def kakao_send_bulk(room_names: list[str], message: str, interval_sec: float = 0
         return {"error": f"Failed to send bulk messages: {e}"}
 
 
-@app.tool()
+@_tool()
 def kakao_send_image(room_name: str, image_paths: list[str]) -> Dict:
     """Send image file(s) to a KakaoTalk chat room.
     Copies the image to clipboard using file-drop format and pastes into the chat.
@@ -129,6 +204,7 @@ def kakao_send_image(room_name: str, image_paths: list[str]) -> Dict:
         image_paths: List of absolute file paths to images (JPG, PNG, GIF, BMP, WebP).
     """
     try:
+        room_name = aliases.resolve(room_name)
         if not image_paths:
             return {"error": "image_paths cannot be empty"}
 
@@ -150,7 +226,7 @@ def kakao_send_image(room_name: str, image_paths: list[str]) -> Dict:
         return {"error": f"Failed to send image: {e}"}
 
 
-@app.tool()
+@_tool()
 def kakao_read_messages(room_name: str, max_messages: int = 50) -> Dict:
     """Read recent messages from a KakaoTalk chat room.
     Uses clipboard-based reading (Ctrl+A, Ctrl+C on the chat list).
@@ -161,6 +237,7 @@ def kakao_read_messages(room_name: str, max_messages: int = 50) -> Dict:
         max_messages: Maximum number of recent messages to return (default 50).
     """
     try:
+        room_name = aliases.resolve(room_name)
         result = controller.read_chat_messages(room_name)
         if not result["success"]:
             return {"error": result["error"]}
@@ -178,7 +255,7 @@ def kakao_read_messages(room_name: str, max_messages: int = 50) -> Dict:
         return {"error": f"Failed to read messages: {e}"}
 
 
-@app.tool()
+@_tool()
 def kakao_extract_links(room_name: str) -> Dict:
     """Extract all URLs/links from messages in a KakaoTalk chat room.
     Reads the chat first, then extracts URLs from all messages.
@@ -187,6 +264,7 @@ def kakao_extract_links(room_name: str) -> Dict:
         room_name: Exact title of the chat room window.
     """
     try:
+        room_name = aliases.resolve(room_name)
         result = controller.read_chat_messages(room_name)
         if not result["success"]:
             return {"error": result["error"]}
@@ -200,7 +278,7 @@ def kakao_extract_links(room_name: str) -> Dict:
         return {"error": f"Failed to extract links: {e}"}
 
 
-@app.tool()
+@_tool()
 def kakao_send_mention(room_name: str, mention_name: str, message: str) -> Dict:
     """Send a message with @mention to a KakaoTalk chat room.
     Types '@' to activate the mention popup, selects the target user,
@@ -213,6 +291,7 @@ def kakao_send_mention(room_name: str, mention_name: str, message: str) -> Dict:
         message: The text message to send after the mention.
     """
     try:
+        room_name = aliases.resolve(room_name)
         if not mention_name.strip():
             return {"error": "Mention name cannot be empty"}
         if not message.strip():
@@ -225,7 +304,7 @@ def kakao_send_mention(room_name: str, mention_name: str, message: str) -> Dict:
         return {"error": f"Failed to send mention message: {e}"}
 
 
-@app.tool()
+@_tool()
 def kakao_download_images(
     room_name: str,
     output_dir: Optional[str] = None,
@@ -250,7 +329,7 @@ def kakao_download_images(
         return {"error": f"Failed to download images: {e}"}
 
 
-@app.tool()
+@_tool()
 def kakao_start_monitor(
     room_name: str,
     keywords: list[str],
@@ -267,6 +346,7 @@ def kakao_start_monitor(
         poll_interval_sec: Seconds between each poll (minimum 3, default 5).
     """
     try:
+        room_name = aliases.resolve(room_name)
         if not keywords:
             return {"error": "Keywords list cannot be empty"}
         result = controller._chat_monitor.start(room_name, keywords, poll_interval_sec)
@@ -277,7 +357,7 @@ def kakao_start_monitor(
         return {"error": f"Failed to start monitor: {e}"}
 
 
-@app.tool()
+@_tool()
 def kakao_stop_monitor() -> Dict:
     """Stop the running chat room monitor."""
     try:
@@ -289,7 +369,7 @@ def kakao_stop_monitor() -> Dict:
         return {"error": f"Failed to stop monitor: {e}"}
 
 
-@app.tool()
+@_tool()
 def kakao_get_monitor_events() -> Dict:
     """Get pending keyword match events from the chat monitor.
     Returns events detected since last call. Each event includes:

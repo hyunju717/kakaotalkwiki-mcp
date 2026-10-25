@@ -14,6 +14,8 @@ WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WM_CHAR = 0x0102
 VK_RETURN = 0x0D
+VK_UP = 0x26
+VK_DOWN = 0x28
 VK_CONTROL = 0x11
 VK_ESCAPE = 0x1B
 VK_A = 0x41
@@ -51,6 +53,7 @@ SEARCH_ACTIVATE_WAIT_SEC = 0.3  # Was 0.5 — after Ctrl+F
 SEARCH_CHAR_INTERVAL_SEC = 0.02  # Per-character typing delay
 SEARCH_RESULTS_WAIT_SEC = 0.8  # Was 1.5 — wait for search results
 SEARCH_OPEN_WAIT_SEC = 0.5  # Was 1.0 — after Enter to open room
+SEARCH_MAX_TRIES = 5  # Max search results to try for an exact title match
 
 # Image sending
 SUPPORTED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
@@ -69,6 +72,12 @@ MENTION_NAME_WAIT_SEC = 0.6  # Was 1.0 — after typing name
 MENTION_SELECT_WAIT_SEC = 0.3  # Was 0.5 — after Enter to select
 MENTION_PASTE_WAIT_SEC = 0.2  # Was 0.3 — after Ctrl+V
 MENTION_SEND_WAIT_SEC = 0.3  # Was 0.5 — after final Enter
+
+# Alias wiki: what the user calls a room -> its exact KakaoTalk title
+ALIASES_FILE = os.path.join(
+    os.environ.get("USERPROFILE", ""),
+    "Documents", "KakaoMCP_aliases.json"
+)
 
 # Default output directory for downloaded images
 DEFAULT_IMAGE_OUTPUT_DIR = os.path.join(
